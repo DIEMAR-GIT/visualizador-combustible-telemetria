@@ -37,6 +37,59 @@ URL_VEL  = f"https://docs.google.com/spreadsheets/d/{VEL_SHEET_ID}/gviz/tq?tqx=o
 # vacías las celdas que no coinciden (ej. fechas pegadas como texto en un mes nuevo)
 URL_VEL_EXPORT = f"https://docs.google.com/spreadsheets/d/{VEL_SHEET_ID}/export?format=csv&gid={GID_VEL}"
 CARGA_URL = "http://bi.sistemaexpreso.com.ar/reporte_hojas.xlsx"
+CARGA_ESTADO = {"msg": ""}
+
+def _secreto(*claves):
+    """Busca una credencial en st.secrets (plano o dentro de [carga])."""
+    try:
+        for k in claves:
+            if k in st.secrets:
+                return str(st.secrets[k])
+        if "carga" in st.secrets:
+            for k in claves:
+                k2 = k.lower().replace("carga_", "")
+                if k2 in st.secrets["carga"]:
+                    return str(st.secrets["carga"][k2])
+    except Exception:
+        pass
+    return None
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def _descargar_reporte_carga():
+    """Descarga el reporte del BI con usuario y contraseña (st.secrets).
+    Prueba autenticación Basic y, si el servidor la pide, Digest.
+    Devuelve (bytes | None, mensaje)."""
+    from requests.auth import HTTPBasicAuth, HTTPDigestAuth
+    usuario = _secreto("CARGA_USER", "CARGA_USUARIO")
+    clave   = _secreto("CARGA_PASS", "CARGA_PASSWORD")
+    url     = _secreto("CARGA_URL") or CARGA_URL
+    hdrs = {"User-Agent": "Mozilla/5.0"}
+    try:
+        if usuario and clave:
+            r = requests.get(url, auth=HTTPBasicAuth(usuario, clave), headers=hdrs, timeout=60)
+            if r.status_code == 401 and "digest" in r.headers.get("WWW-Authenticate", "").lower():
+                r = requests.get(url, auth=HTTPDigestAuth(usuario, clave), headers=hdrs, timeout=60)
+        else:
+            r = requests.get(url, headers=hdrs, timeout=60)
+    except Exception as e:
+        return None, f"Sin conexión con el BI: {type(e).__name__}: {e}"
+    if r.status_code == 401:
+        if not (usuario and clave):
+            return None, "El BI pide usuario y contraseña: cargá CARGA_USER y CARGA_PASS en los Secrets de Streamlit."
+        return None, "El BI rechazó el usuario/contraseña (HTTP 401). Revisá CARGA_USER y CARGA_PASS en los Secrets."
+    if r.status_code != 200:
+        return None, f"El BI respondió HTTP {r.status_code}"
+    if r.content[:2] != b"PK":
+        return None, "El BI devolvió una página en lugar del Excel (probablemente un formulario de login, no autenticación HTTP)."
+    return r.content, "OK"
+
+def leer_reporte_carga():
+    import io
+    contenido, msg = _descargar_reporte_carga()
+    CARGA_ESTADO["msg"] = msg
+    if contenido is None:
+        raise RuntimeError(msg)
+    return pd.read_excel(io.BytesIO(contenido))
 # ── DATOS MANEJO (Score Conducción) ───────────────────────────────────────
 MANEJO_SHEET_ID = "1teVcN0ejyvGbjWwWOHTmZ8I-17xyGZ0d8hxJ7dwSKm0"
 MANEJO_SHEETS   = [
@@ -404,7 +457,7 @@ def cargar_velocidad():
 def cargar_carga(tractores_validos=None):
     try:
         import re
-        df = pd.read_excel(CARGA_URL)
+        df = leer_reporte_carga()
         df.columns = [str(c).strip() for c in df.columns]
         col_unid   = next((c for c in df.columns if 'UNID'    in c.upper()), None)
         col_peso   = next((c for c in df.columns if 'PESO'    in c.upper() and 'ENTREGAD' in c.upper()), None)
@@ -443,7 +496,7 @@ def cargar_carga(tractores_validos=None):
 def cargar_viajes_todos():
     try:
         import re
-        df = pd.read_excel(CARGA_URL)
+        df = leer_reporte_carga()
         df.columns = [str(c).strip() for c in df.columns]
         col_unid   = next((c for c in df.columns if 'UNID'    in c.upper()), None)
         col_peso   = next((c for c in df.columns if 'PESO'    in c.upper() and 'ENTREGAD' in c.upper()), None)
@@ -477,7 +530,7 @@ def cargar_viajes_ier(tractores_validos=None):
     vacio = pd.DataFrame(columns=['DOMINIO','MES','PESO_TON','RUTA'])
     diag = {'ruta': False, 'n_viajes': 0, 'n_descartados': 0}
     try:
-        df = pd.read_excel(CARGA_URL)
+        df = leer_reporte_carga()
         df.columns = [str(c).strip() for c in df.columns]
         cols_up = {c: c.upper() for c in df.columns}
         col_unid   = next((c for c, u in cols_up.items() if 'UNID' in u), None)
@@ -2644,7 +2697,7 @@ elif pg == "🔧 Diagnóstico":
     st.markdown('## 📦 Carga (BI)')
     _ok_car = not df_carga_raw.empty
     _det_car = f'{len(df_carga_raw):,} registros mensuales · {df_carga_raw["DOMINIO"].nunique() if _ok_car else 0} patentes con carga · {df_carga_raw["PESO_TON"].sum():,.1f} ton totales' if _ok_car else 'Sin datos de carga del BI'
-    _diag_card('Peso entregado', _ok_car, _det_car, f'Fuente: {CARGA_URL}')
+    _diag_card('Peso entregado', _ok_car, _det_car, f'Fuente: {CARGA_URL} · Estado: {_descargar_reporte_carga()[1]}')
     st.markdown('## 🚛 Viajes')
     _ok_vj = not df_viajes_raw.empty
     _det_vj = f'{len(df_viajes_raw):,} viajes · {df_viajes_raw["DOMINIO"].nunique() if _ok_vj else 0} patentes' if _ok_vj else 'Sin datos de viajes'
