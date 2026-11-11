@@ -6,6 +6,7 @@ import pandas as pd
 import streamlit as st
 import numpy as np
 import requests
+import io
 from bs4 import BeautifulSoup
 from sklearn.linear_model import LinearRegression
 from sklearn.preprocessing import PolynomialFeatures
@@ -37,6 +38,11 @@ URL_VEL  = f"https://docs.google.com/spreadsheets/d/{VEL_SHEET_ID}/gviz/tq?tqx=o
 # vacías las celdas que no coinciden (ej. fechas pegadas como texto en un mes nuevo)
 URL_VEL_EXPORT = f"https://docs.google.com/spreadsheets/d/{VEL_SHEET_ID}/export?format=csv&gid={GID_VEL}"
 CARGA_URL = "http://bi.sistemaexpreso.com.ar/reporte_hojas.xlsx"
+# "Histórico Combustible Estaciones — Diemar", solapa "cargas" (una fila por carga en surtidor)
+ESTACIONES_SHEET_ID = "1bEGaA3IFta106kFrEsIXE9r71MT-LVIXXMVMx7xrgMc"
+ESTACIONES_GID      = "0"
+URL_ESTACIONES      = f"https://docs.google.com/spreadsheets/d/{ESTACIONES_SHEET_ID}/export?format=csv&gid={ESTACIONES_GID}"
+URL_ESTACIONES_GVIZ = f"https://docs.google.com/spreadsheets/d/{ESTACIONES_SHEET_ID}/gviz/tq?tqx=out:csv&gid={ESTACIONES_GID}"
 CARGA_ESTADO = {"msg": ""}
 
 def _secreto(*claves):
@@ -219,6 +225,12 @@ pg = st.sidebar.radio(
 )
 st.sidebar.markdown("---")
 st.sidebar.image(LOGO_URL, width=160)
+usar_litros_estaciones = st.sidebar.toggle(
+    '⛽ Litros desde estaciones',
+    value=False,
+    help='Apagado: litros y L/100km de la telemetría. Encendido: litros de la planilla '
+         '"Histórico Combustible Estaciones" (suma de cargas por patente y mes) y L/100km '
+         'recalculado con esos litros sobre los mismos km de telemetría.')
 def normalizar_patente(valor):
     """Normaliza dominios: upper + solo alfanuméricos.
        Elimina espacios normales, \\xa0, \\u200b y cualquier
@@ -996,6 +1008,78 @@ def calcular_ier(df, df_vel=None, df_viajes=None, df_manejo=None):
         'tiene_peso': bool(mes['TON_VIAJE'].notna().any()),
     }
     return out
+def _num_ar(serie):
+    """Números con coma o punto decimal: '420,218' · '420.218' · '1.079.539,01'."""
+    s = serie.astype(str).str.strip().str.replace('\xa0', '', regex=False).str.replace(' ', '', regex=False)
+    ambos = s.str.contains(',', regex=False) & s.str.contains('.', regex=False)
+    s = s.where(~ambos, s.str.replace('.', '', regex=False))
+    s = s.str.replace(',', '.', regex=False)
+    return pd.to_numeric(s, errors='coerce')
+@st.cache_data(ttl=600, show_spinner=False)
+def cargar_litros_estaciones():
+    """Litros cargados en estaciones, sumados por DOMINIO + mes.
+       Devuelve (df[DOMINIO, MES_PERIODO, LITROS_EST, N_CARGAS], diag)."""
+    diag = {'err': '', 'rows': 0, 'sin_patente': 0, 'url': ''}
+    vacio = pd.DataFrame(columns=['DOMINIO', 'MES_PERIODO', 'LITROS_EST', 'N_CARGAS'])
+    df = None
+    for url in (URL_ESTACIONES, URL_ESTACIONES_GVIZ):
+        try:
+            r = requests.get(url, timeout=30)
+            if r.status_code == 200 and not r.text.lstrip().lower().startswith('<!doctype'):
+                df = pd.read_csv(io.StringIO(r.text), dtype=str)
+                diag['url'] = url
+                break
+            diag['err'] = f'HTTP {r.status_code} (¿la planilla está compartida "cualquiera con el enlace"?)'
+        except Exception as e:
+            diag['err'] = str(e)
+    if df is None or df.empty:
+        return vacio, diag
+    df.columns = [str(c).strip().lower() for c in df.columns]
+    def col(*claves):
+        for c in df.columns:
+            if any(k in c for k in claves):
+                return c
+        return None
+    c_pat, c_fec, c_lts = col('patente', 'dominio'), col('fecha'), col('litros')
+    diag['cols'] = list(df.columns)
+    if not (c_pat and c_fec and c_lts):
+        diag['err'] = f'Faltan columnas (patente={c_pat}, fecha={c_fec}, litros={c_lts})'
+        return vacio, diag
+    out = pd.DataFrame({
+        'DOMINIO': df[c_pat].fillna('').apply(normalizar_patente),
+        'FECHA':   parse_fecha_mixta(df[c_fec]),
+        'LITROS':  _num_ar(df[c_lts]),
+    })
+    diag['rows'] = len(out)
+    diag['sin_patente'] = int((out['DOMINIO'].str.len() < 5).sum())
+    out = out[(out['DOMINIO'].str.len() >= 5) & out['FECHA'].notna() & (out['LITROS'] > 0)]
+    out['MES_PERIODO'] = out['FECHA'].dt.to_period('M')
+    g = (out.groupby(['DOMINIO', 'MES_PERIODO'])
+            .agg(LITROS_EST=('LITROS', 'sum'), N_CARGAS=('LITROS', 'size'))
+            .reset_index())
+    diag['err'] = 'OK'
+    return g, diag
+def aplicar_litros_estaciones(df_tel, df_est):
+    """Reemplaza LITROS de la telemetría por los litros de estaciones (por DOMINIO+mes).
+       Los KM no se tocan. Si un mes de una patente tiene varias filas de telemetría,
+       los litros del mes se reparten proporcional a los km de cada fila.
+       Patente+mes sin cargas en estaciones → se excluye (no hay litros para comparar)."""
+    d = df_tel.copy()
+    d['_MES'] = d['FECHA'].dt.to_period('M')
+    est = df_est.rename(columns={'MES_PERIODO': '_MES'})[['DOMINIO', '_MES', 'LITROS_EST']]
+    d = d.merge(est, on=['DOMINIO', '_MES'], how='left')
+    n_antes = d[['DOMINIO', '_MES']].drop_duplicates().shape[0]
+    d = d[d['LITROS_EST'].notna()].copy()
+    km_mes = d.groupby(['DOMINIO', '_MES'])['KM'].transform('sum')
+    n_mes  = d.groupby(['DOMINIO', '_MES'])['KM'].transform('size')
+    peso = np.where(km_mes > 0, d['KM'] / km_mes.replace(0, np.nan), 1.0 / n_mes)
+    d['LITROS'] = (d['LITROS_EST'] * peso).astype(float)
+    d['L100KM'] = (d['LITROS'] / d['KM'].replace(0, np.nan) * 100).round(2).fillna(0)
+    if 'RALENTI_PCT' in d.columns:
+        d['RALENTI'] = (d['RALENTI_PCT'] / 100.0) * d['LITROS']
+    n_despues = d[['DOMINIO', '_MES']].drop_duplicates().shape[0]
+    d.drop(columns=['_MES', 'LITROS_EST'], inplace=True)
+    return d.reset_index(drop=True), {'excluidos': n_antes - n_despues, 'usados': n_despues}
 with st.spinner('Cargando telemetría, velocidades y datos de carga...'):
     df_raw, _      = cargar_datos()
     df_vel_raw, vel_diag = cargar_velocidad()
@@ -1009,6 +1093,19 @@ with st.spinner('Cargando telemetría, velocidades y datos de carga...'):
 if df_raw.empty:
     st.warning('No se pudieron cargar datos.')
     st.stop()
+df_estaciones, estaciones_diag = cargar_litros_estaciones()
+estaciones_info = {}
+if usar_litros_estaciones:
+    if df_estaciones.empty:
+        st.sidebar.error(f'Sin datos de estaciones — se usan litros de telemetría. {estaciones_diag.get("err","")}')
+        usar_litros_estaciones = False
+    else:
+        df_raw, estaciones_info = aplicar_litros_estaciones(df_raw, df_estaciones)
+        st.sidebar.caption(f'⛽ Fuente de litros: estaciones · {estaciones_info["usados"]} patente-mes usados, '
+                           f'{estaciones_info["excluidos"]} sin cargas excluidos')
+        if df_raw.empty:
+            st.warning('Ninguna patente/mes de telemetría tiene cargas en la planilla de estaciones.')
+            st.stop()
 if not (gasto_comb_prom is None or (isinstance(gasto_comb_prom, float) and np.isnan(gasto_comb_prom))):
     precio_gasoil = float(gasto_comb_prom)
     precio_fuente = f"X10 {gasto_comb_mes} (planilla gastos)"
@@ -1141,7 +1238,7 @@ if pg == "Dashboard Principal":
     with col_title:
         st.markdown(f"""<div style='padding:8px 0;'>
         <div style='font-size:1.6rem;font-weight:800;color:#f1f5f9;'>Expreso Diemar &mdash; Dashboard LAD {anio_sel}</div>
-        <div style='font-size:.9rem;color:#94a3b8;margin-top:4px;'>Telemetría flota LAD &middot; Año {anio_sel} &middot; Actualización automática</div>
+        <div style='font-size:.9rem;color:#94a3b8;margin-top:4px;'>Telemetría flota LAD &middot; Litros: {'estaciones' if usar_litros_estaciones else 'telemetría'} &middot; Año {anio_sel} &middot; Actualización automática</div>
         </div>""", unsafe_allow_html=True)
     st.markdown(f'<div style="margin-bottom:12px;"><span class="price-badge">&#9981; Precio gasoil: <b>${precio_gasoil:,.0f}/L</b></span>&nbsp;&nbsp;<span style="font-size:.75rem;color:#94a3b8;">Fuente: {precio_fuente}</span></div>', unsafe_allow_html=True)
     st.markdown(f'<div class="sec-title">Métricas Globales — {anio_sel}</div>', unsafe_allow_html=True)
@@ -2669,6 +2766,13 @@ elif pg == "🔧 Diagnóstico":
     _ok_tel = not df_raw.empty
     _det_tel = f'{len(df_raw):,} filas · {df_raw["DOMINIO"].nunique() if _ok_tel else 0} patentes · {df_raw["FECHA"].min()} → {df_raw["FECHA"].max()}' if _ok_tel else 'Sin datos cargados'
     _diag_card('Telemetría LAD', _ok_tel, _det_tel, f'Fuente: {URL_TEL}')
+    st.markdown('## ⛽ Litros desde estaciones')
+    _ok_est = not df_estaciones.empty
+    _det_est = (f'{int(df_estaciones["N_CARGAS"].sum()):,} cargas · {df_estaciones["DOMINIO"].nunique()} patentes · '
+                f'{df_estaciones["LITROS_EST"].sum():,.0f} L · {df_estaciones["MES_PERIODO"].min()} → {df_estaciones["MES_PERIODO"].max()} · '
+                f'{estaciones_diag.get("sin_patente",0)} filas sin patente (no se usan) · '
+                f'Botón: {"ENCENDIDO" if usar_litros_estaciones else "apagado"}') if _ok_est else f'Sin datos. {estaciones_diag.get("err","")}'
+    _diag_card('Histórico Combustible Estaciones', _ok_est, _det_est, f'Fuente: {estaciones_diag.get("url") or URL_ESTACIONES}')
     st.markdown('## 🚦 Velocidades')
     _ok_vel = not df_vel_raw.empty
     _tiene_coords = _ok_vel and ('LAT' in df_vel_raw.columns) and ('LON' in df_vel_raw.columns) and df_vel_raw[['LAT','LON']].notna().any().any()
