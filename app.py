@@ -1106,6 +1106,18 @@ if usar_litros_estaciones:
         if df_raw.empty:
             st.warning('Ninguna patente/mes de telemetría tiene cargas en la planilla de estaciones.')
             st.stop()
+        # Patentes sin litros en estaciones: no se toman en ninguna otra fuente
+        _pats_con_lts = set(df_raw['DOMINIO'].dropna().unique())
+        def _solo_con_lts(d):
+            if d is None or not isinstance(d, pd.DataFrame) or d.empty or 'DOMINIO' not in d.columns:
+                return d
+            return d[d['DOMINIO'].isin(_pats_con_lts)].copy()
+        df_vel_raw      = _solo_con_lts(df_vel_raw)
+        df_carga_raw    = _solo_con_lts(df_carga_raw)
+        df_viajes_ier   = _solo_con_lts(df_viajes_ier)
+        df_viajes_raw   = _solo_con_lts(df_viajes_raw)
+        df_manejo_raw   = _solo_con_lts(df_manejo_raw)
+        df_arreglos_raw = _solo_con_lts(df_arreglos_raw)
 if not (gasto_comb_prom is None or (isinstance(gasto_comb_prom, float) and np.isnan(gasto_comb_prom))):
     precio_gasoil = float(gasto_comb_prom)
     precio_fuente = f"X10 {gasto_comb_mes} (planilla gastos)"
